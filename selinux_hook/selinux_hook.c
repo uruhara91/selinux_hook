@@ -504,6 +504,7 @@ static bool use_clean_blob_route(void);
 static bool use_legacy_clean_blob_query(void);
 static bool selinux_49_compat_path(void);
 static bool selinux_414_compat_path(void);
+static bool dirtysepolicy_string_match_supported(void);
 static bool clean_policydb_redirect_supported(void);
 static bool selinux_compat_call_needed(void);
 static bool policydb_offset_fallback_allowed(void);
@@ -789,6 +790,21 @@ static bool selinux_49_compat_path(void)
 static bool selinux_414_compat_path(void)
 {
     return kver < VERSION(4, 15, 0);
+}
+
+/*
+ * dirtysepolicy_context_should_hide()/dirtysepolicy_access_should_deny() are
+ * gated on selinux_414_compat_path() (< 4.15), leaving them inactive on 4.19
+ * -- confirmed leaking "u:r:magisk:s0" (Infinix X6815B, 4.19.191). The
+ * string-matching logic doesn't depend on ABI/struct layout, so this widens
+ * coverage to the audited 4.19.x range without touching
+ * selinux_414_compat_path() (still used elsewhere for real ABI decisions)
+ * or untested kernel ranges (4.15-4.18, 4.20+).
+ */
+static bool dirtysepolicy_string_match_supported(void)
+{
+    return selinux_414_compat_path() ||
+           (kver >= VERSION(4, 19, 0) && kver < VERSION(4, 20, 0));
 }
 
 static bool clean_policydb_redirect_supported(void)
@@ -2225,7 +2241,7 @@ static bool context_token_matches(const char *query, const char *lit)
 
 static bool dirtysepolicy_context_should_hide(const char *query)
 {
-    if (!selinux_414_compat_path())
+    if (!dirtysepolicy_string_match_supported())
         return false;
 
     /*
@@ -2372,7 +2388,7 @@ static bool dirtysepolicy_access_should_deny(const char *query, size_t len)
     const char *src;
     const char *dst;
 
-    if (!selinux_414_compat_path())
+    if (!dirtysepolicy_string_match_supported())
         return false;
     if (!query || !len)
         return false;
@@ -2783,7 +2799,18 @@ static void before_policydb_arg0(hook_fargs6_t *a, void *u)
         WRITE_ONCE(g_first_policydb, policydb);
         selinux_hook_dbg("[selinux_hook] SAVED first policydb @ %px\n", g_first_policydb);
         refresh_clean_policydb("first_compute_av", false);
-        snapshot_clean_policy("first_compute_av");
+        /* compat_legacy_load: legacy no-load-state ABI commits policy directly
+         * into live policydb/sidtab while converting -- a concurrent read here,
+         * on the very first call, can hit a partially-converted structure and
+         * crash inside ebitmap_write() via security_read_policy(). Confirmed
+         * via console-ramoops (Infinix X6815B, 4.19.191, recovery boot); same
+         * bug class documented for RHEL 4.18: https://access.redhat.com/solutions/6128151
+         * Kernels with the staged ABI build off to the side and swap
+         * atomically, so keep original fast-path behavior there. */
+        if (security_load_policy_has_load_state())
+            snapshot_clean_policy("first_compute_av");
+        else
+            selinux_hook_dbg("[selinux_hook] compat_legacy_load: deferring snapshot, no staged load_state ABI\n");
         return;
     }
 
@@ -2986,6 +3013,8 @@ static void before_sel_write_access(hook_fargs4_t *a, void *u)
         return;
     }
 
+    /* Only fires post-selinuxfs-mount, from real userspace writes. */
+    snapshot_clean_policy("sel_write_access");
     refresh_clean_policydb("access", true);
 
     n = READ_ONCE(g_clean_access_count) + 1;
@@ -3104,6 +3133,8 @@ static void before_sel_write_context(hook_fargs4_t *a, void *u)
         return;
     }
 
+    /* See before_sel_write_access(). */
+    snapshot_clean_policy("sel_write_context");
     refresh_clean_policydb("context", true);
 
     n = READ_ONCE(g_clean_access_count) + 1;
