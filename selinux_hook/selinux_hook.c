@@ -25,7 +25,10 @@
 #include <kputils.h>
 
 KPM_NAME("selinux_magisk_access_filter");
-KPM_VERSION("1.1.3");
+#ifndef SELINUX_VERSION
+#define SELINUX_VERSION "1.1.4"
+#endif
+KPM_VERSION(SELINUX_VERSION);
 KPM_LICENSE("All rights reserved.");
 KPM_AUTHOR("Admire");
 KPM_DESCRIPTION("Audit and reject Magisk /sys/fs/selinux/access probes");
@@ -37,6 +40,8 @@ KPM_DESCRIPTION("Audit and reject Magisk /sys/fs/selinux/access probes");
 #define SELINUX_LEGACY_BLOB_QUERY_MAX VERSION(4, 15, 0)
 #define SELINUX_BLOB_ROUTE_MIN VERSION(5, 3, 0)
 #define SELINUX_BLOB_ROUTE_MAX VERSION(6, 2, 0)
+#define SELINUX_49_MIN VERSION(4, 9, 0)
+#define SELINUX_49_MAX VERSION(4, 10, 0)
 #define contains_case_literal(s, len, lit) contains_case_lit((s), (len), (lit), sizeof(lit) - 1)
 
 #define MAGISK_MOCK_POLICY_PATH "/dev/.magisk_selinux_mock/load"
@@ -48,6 +53,12 @@ KPM_DESCRIPTION("Audit and reject Magisk /sys/fs/selinux/access probes");
 #define SELINUX_STATUS_SIZE 20
 #define SELINUX_STATUS_CLEAN_SEQUENCE 4
 #define SELINUX_STATUS_CLEAN_POLICYLOAD 1
+#define APATCH_MANAGER_PACKAGE "me.bmax.apatch"
+#define APATCH_PACKAGES_LIST_PATH "/data/system/packages.list"
+#define APATCH_PACKAGES_LIST_MAX_SIZE (1024 * 1024)
+#ifndef APATCH_MANAGER_UID
+#define APATCH_MANAGER_UID ((uid_t)-1)
+#endif
 
 #define selinux_hook_dbg(fmt, ...) pr_info(fmt, ##__VA_ARGS__)
 
@@ -436,6 +447,7 @@ static u32 g_status_read_count;
 static u32 g_status_probe_count;
 static u32 g_status_redirect_count;
 static bool g_simple_read_from_buffer_hooked;
+static uid_t g_apatch_manager_uid = APATCH_MANAGER_UID;
 
 struct access_probe {
     u32 id;
@@ -490,6 +502,7 @@ static void log_bypass_once(const char *node, uid_t uid, const char *query);
 static void cancel_clean_sidtab_convert(const char *reason);
 static bool use_clean_blob_route(void);
 static bool use_legacy_clean_blob_query(void);
+static bool selinux_49_compat_path(void);
 static bool selinux_414_compat_path(void);
 static bool clean_policydb_redirect_supported(void);
 static bool selinux_compat_call_needed(void);
@@ -763,6 +776,16 @@ static bool use_legacy_clean_blob_query(void)
     return kver < SELINUX_LEGACY_BLOB_QUERY_MAX;
 }
 
+/*
+ * 4.9-only gate / 仅 4.9 开关：
+ * All Polaris 4.9 ABI branches should enter through this helper so 4.14/5.x/6.x
+ * keep their existing paths. 所有 4.9 专用逻辑都集中走这里，避免误伤其他内核。
+ */
+static bool selinux_49_compat_path(void)
+{
+    return kver >= SELINUX_49_MIN && kver < SELINUX_49_MAX;
+}
+
 static bool selinux_414_compat_path(void)
 {
     return kver < VERSION(4, 15, 0);
@@ -802,6 +825,13 @@ static bool clean_policydb_redirect_supported(void)
 static bool current_is_policy_manager(void)
 {
     const char *comm = current_comm();
+
+    /* 4.9 only / 仅 4.9：APatch UI 用 UID 放行，避免误拦管理器自身查询。 */
+    if (selinux_49_compat_path()) {
+        uid_t apatch_uid = READ_ONCE(g_apatch_manager_uid);
+        if (apatch_uid != (uid_t)-1 && current_uid() == apatch_uid)
+            return true;
+    }
 
     if (str_eq_lit(comm, "magiskpolicy") ||
         str_eq_lit(comm, "apd") ||
@@ -1501,6 +1531,144 @@ static ssize_t call_kernel_read_file(struct file *file, void *buf, size_t count,
     return kernel_read_fn(file, buf, count, pos);
 }
 
+/*
+ * APatch manager UID detection / APatch 管理器 UID 识别：
+ * Polaris 4.9 uses a UID bypass for APatch UI reads because task names are not
+ * a stable manager signal. 仅 4.9 使用该 UID 旁路，其他内核保持原来的 comm 判断。
+ */
+static bool package_line_starts_with_apatch(const char *line, const char *end)
+{
+    const char *pkg = APATCH_MANAGER_PACKAGE;
+    size_t line_len = (size_t)(end - line);
+    size_t i;
+
+    for (i = 0; pkg[i]; i++) {
+        if (i >= line_len || line[i] != pkg[i])
+            return false;
+    }
+
+    return i < line_len && line[i] == ' ';
+}
+
+static bool parse_decimal_uid(const char **cursor, const char *end, uid_t *out)
+{
+    const char *p = *cursor;
+    unsigned long value = 0;
+    bool any = false;
+
+    while (p < end && *p >= '0' && *p <= '9') {
+        any = true;
+        value = value * 10 + (unsigned long)(*p - '0');
+        if (value > 10000000UL)
+            return false;
+        p++;
+    }
+
+    if (!any)
+        return false;
+
+    *cursor = p;
+    *out = (uid_t)value;
+    return true;
+}
+
+static bool parse_apatch_manager_uid(const char *buf, size_t len, uid_t *out)
+{
+    const char *p = buf;
+    const char *end = buf + len;
+
+    while (p < end) {
+        const char *line = p;
+        const char *line_end = line;
+
+        while (line_end < end && *line_end != '\n' && *line_end != '\r')
+            line_end++;
+
+        if (package_line_starts_with_apatch(line, line_end)) {
+            const char *q = line;
+
+            while (q < line_end && *q != ' ')
+                q++;
+            while (q < line_end && *q == ' ')
+                q++;
+
+            return parse_decimal_uid(&q, line_end, out);
+        }
+
+        while (line_end < end && (*line_end == '\n' || *line_end == '\r'))
+            line_end++;
+        p = line_end;
+    }
+
+    return false;
+}
+
+static void detect_apatch_manager_uid(void)
+{
+    struct file *filp;
+    void *data;
+    loff_t len;
+    loff_t pos;
+    ssize_t nread;
+    uid_t uid;
+
+    if (READ_ONCE(g_apatch_manager_uid) != (uid_t)-1) {
+        pr_info("[selinux_hook] APatch manager uid preset uid=%d\n",
+                READ_ONCE(g_apatch_manager_uid));
+        return;
+    }
+
+    if (!vmalloc_fn || !vfree_fn || !filp_open_fn || !filp_close_fn ||
+        !kernel_read_fn || !vfs_llseek_fn) {
+        pr_warn("[selinux_hook] APatch manager uid detection disabled open=%px close=%px read=%px llseek=%px vmalloc=%px vfree=%px\n",
+                filp_open_fn, filp_close_fn, kernel_read_fn, vfs_llseek_fn,
+                vmalloc_fn, vfree_fn);
+        return;
+    }
+
+    filp = filp_open_fn(APATCH_PACKAGES_LIST_PATH, O_RDONLY, 0);
+    if (!filp || IS_ERR(filp)) {
+        pr_warn("[selinux_hook] APatch manager uid open failed path=%s rc=%ld\n",
+                APATCH_PACKAGES_LIST_PATH, filp ? PTR_ERR(filp) : -ENOENT);
+        return;
+    }
+
+    len = vfs_llseek_fn(filp, 0, SEEK_END);
+    if (len <= 0 || len > APATCH_PACKAGES_LIST_MAX_SIZE) {
+        pr_warn("[selinux_hook] APatch manager uid bad packages.list len=%lld\n", len);
+        filp_close_fn(filp, 0);
+        return;
+    }
+    vfs_llseek_fn(filp, 0, SEEK_SET);
+
+    data = vmalloc_fn((unsigned long)len);
+    if (!data) {
+        pr_warn("[selinux_hook] APatch manager uid alloc failed len=%lld\n", len);
+        filp_close_fn(filp, 0);
+        return;
+    }
+
+    pos = 0;
+    nread = call_kernel_read_file(filp, data, (size_t)len, &pos);
+    filp_close_fn(filp, 0);
+    if (nread != len || pos != len) {
+        pr_warn("[selinux_hook] APatch manager uid read failed read=%ld pos=%lld len=%lld\n",
+                (long)nread, pos, len);
+        vfree_fn(data);
+        return;
+    }
+
+    if (parse_apatch_manager_uid((const char *)data, (size_t)len, &uid)) {
+        WRITE_ONCE(g_apatch_manager_uid, uid);
+        pr_info("[selinux_hook] APatch manager uid detected package=%s uid=%d\n",
+                APATCH_MANAGER_PACKAGE, uid);
+    } else {
+        pr_warn("[selinux_hook] APatch manager uid not found package=%s\n",
+                APATCH_MANAGER_PACKAGE);
+    }
+
+    vfree_fn(data);
+}
 static bool magiskinit_process_exists(void)
 {
     struct task_struct *init;
@@ -2685,6 +2853,27 @@ static void before_sel_write_access(hook_fargs4_t *a, void *u)
         return;
     }
 
+    /* 4.9 path / 4.9 路径：helper ABI 不稳定，只用 legacy probe 过滤。 */
+    if (selinux_49_compat_path()) {
+        if (legacy_should_block_access_query(sample, sample_len)) {
+            n = READ_ONCE(g_clean_access_count) + 1;
+            WRITE_ONCE(g_clean_access_count, n);
+            a->local.data0 = 4;
+            a->local.data1 = n;
+            slot = n & (ACCESS_PROBE_SLOTS - 1);
+            a->local.data2 = slot;
+            g_probes[slot].id = n;
+            g_probes[slot].uid = uid;
+            g_probes[slot].node = "access";
+            copy_bytes(g_probes[slot].query, sample, ACCESS_SAMPLE_MAX);
+            pr_info("[selinux_hook] DIRTYSEPOLICY deny /sys/fs/selinux/access 4.9 #%u uid=%d comm=%s query=\"%s\"\n",
+                    n, uid, current_comm(), sample);
+            a->skip_origin = 1;
+            a->ret = -EINVAL;
+        }
+        return;
+    }
+
     if (!clean_policydb_redirect_supported()) {
         snapshot_clean_policy("legacy_access");
         if (legacy_clean_query_should_block(sample, sample_len, true)) {
@@ -2779,6 +2968,27 @@ static void before_sel_write_context(hook_fargs4_t *a, void *u)
                 n, uid, current_comm(), sample);
         a->skip_origin = 1;
         a->ret = -EINVAL;
+        return;
+    }
+
+    /* 4.9 path / 4.9 路径：helper ABI 不稳定，只用 legacy probe 过滤。 */
+    if (selinux_49_compat_path()) {
+        if (legacy_should_block_access_query(sample, sample_len)) {
+            n = READ_ONCE(g_clean_access_count) + 1;
+            WRITE_ONCE(g_clean_access_count, n);
+            a->local.data0 = 4;
+            a->local.data1 = n;
+            slot = n & (ACCESS_PROBE_SLOTS - 1);
+            a->local.data2 = slot;
+            g_probes[slot].id = n;
+            g_probes[slot].uid = uid;
+            g_probes[slot].node = "context";
+            copy_bytes(g_probes[slot].query, sample, ACCESS_SAMPLE_MAX);
+            pr_info("[selinux_hook] DIRTYSEPOLICY hide /sys/fs/selinux/context 4.9 #%u uid=%d comm=%s query=\"%s\"\n",
+                    n, uid, current_comm(), sample);
+            a->skip_origin = 1;
+            a->ret = -EINVAL;
+        }
         return;
     }
 
@@ -3022,11 +3232,58 @@ static int install_write_op_hooks(void)
 
     /* Prefer direct symbol lookup; fall back to LLVM-suffix variant */
     addr_access = (unsigned long)lookup_name_optional_suffix("sel_write_access");
-
     addr_context = (unsigned long)lookup_name_optional_suffix("sel_write_context");
     log_symbol_addr("sel_write_access", (void *)addr_access);
     log_symbol_addr("sel_write_context", (void *)addr_context);
 
+    /*
+     * Polaris 4.9 write_op path / Polaris 4.9 write_op 路径：
+     * direct sel_write_* symbols are unreliable here; write_op[5]/[6] are the
+     * SEL_CONTEXT/SEL_ACCESS slots from the 4.9 selinuxfs layout.
+     */
+    if (selinux_49_compat_path()) {
+        write_op = (sel_write_op_fn *)lookup_name_optional_suffix("write_op");
+        log_symbol_addr("write_op", write_op);
+        if (!write_op) {
+            pr_err("[selinux_hook] write_op missing on 4.9\n");
+            return -ENOENT;
+        }
+
+        g_write_op_context_slot = &write_op[SEL_WRITE_OP_CONTEXT];
+        g_write_op_access_slot = &write_op[SEL_WRITE_OP_ACCESS];
+
+        if (!READ_ONCE(*g_write_op_context_slot)) {
+            pr_err("[selinux_hook] write_op context slot is empty\n");
+            return -ENOENT;
+        }
+        if (!READ_ONCE(*g_write_op_access_slot)) {
+            pr_err("[selinux_hook] write_op access slot is empty\n");
+            return -ENOENT;
+        }
+
+        rc = hotpatch_write_op_slot(g_write_op_access_slot, hooked_sel_write_access,
+                                    &g_orig_write_op_access);
+        if (rc) {
+            pr_err("[selinux_hook] patch write_op access failed rc=%d\n", rc);
+            return rc;
+        }
+        g_write_op_access_patched = true;
+
+        rc = hotpatch_write_op_slot(g_write_op_context_slot, hooked_sel_write_context,
+                                    &g_orig_write_op_context);
+        if (rc) {
+            pr_err("[selinux_hook] patch write_op context failed rc=%d\n", rc);
+            uninstall_write_op_hooks();
+            return rc;
+        }
+        g_write_op_context_patched = true;
+
+        pr_info("[selinux_hook] hook sel_write_context argc=3 mode=write_op[5] 4.9\n");
+        pr_info("[selinux_hook] hook sel_write_access argc=3 mode=write_op[6] 4.9\n");
+        return 0;
+    }
+
+    /* Non-4.9 / 非 4.9：保持原来的 direct-symbol-first hook 顺序。 */
     if (addr_access) {
         g_funcs[g_hooks++] = (void *)addr_access;
         pr_info("[selinux_hook] hook sel_write_access argc=3 mode=direct\n");
@@ -3064,7 +3321,7 @@ static int install_write_op_hooks(void)
      * 不存在，就记录降级原因，而不是再尝试写 write_op[]。
      *
      * That failure happens before module init(), so this c02-compatible build
-     * deliberately avoids importing hotpatch_nosync at all.  If direct symbols
+     * deliberately avoids importing hotpatch_nosync at all. If direct symbols
      * are absent, log the downgrade and keep the KPM loaded for diagnostics
      * instead of failing relocation.
      */
@@ -3167,6 +3424,28 @@ static bool filter_procattr_current(const char *hook, const char *lsm,
 
     sample[0] = '\0';
     sample_len = value && size ? copy_query_sample(sample, (const char *)value, size) : 0;
+    /*
+     * 4.9 setprocattr path / 4.9 setprocattr 路径：
+     * avoid clean policydb helpers with device-specific ABI; only block known
+     * DirtySepolicy probes while allowing manager/root callers through.
+     */
+    if (selinux_49_compat_path()) {
+        uid = current_uid();
+        manager = (uid < 10000) || current_is_policy_manager();
+        if (!manager && (dirtysepolicy_context_should_hide(sample) ||
+                         legacy_should_block_access_query(sample, sample_len)))
+            clean_ret = -EINVAL;
+        blocked = !manager && clean_ret == -EINVAL;
+
+        n = READ_ONCE(g_procattr_current_count) + 1;
+        WRITE_ONCE(g_procattr_current_count, n);
+        pr_info("[selinux_hook] AUDIT /proc/self/attr/current 4.9 #%u hook=%s lsm=%s uid=%d comm=%s name_ptr=%px value=%px size=%zu sample_len=%zu manager=%d action=%s forced_ret=%d query=\"%s\"\n",
+                n, hook ?: "?", lsm ?: "-", uid, current_comm(), name, value, size,
+                sample_len, manager, blocked ? "block" : "pass", blocked ? -EINVAL : 0,
+                sample);
+        return blocked;
+    }
+
     manager = current_is_policy_manager();
     if (!manager) {
         if (dirtysepolicy_context_should_hide(sample)) {
@@ -3240,7 +3519,52 @@ static void before_security_setprocattr(hook_fargs4_t *a, void *u)
     a->ret = -EINVAL;
 }
 
+
+/*
+ * Shared task-first setprocattr body / 共用的 task-first setprocattr 主体：
+ * Polaris 4.9 passes (task, name, value, size), so arg0 is not lsm/name and the
+ * normal wrappers cannot be reused directly. 两个 4.9 wrapper 只差日志名和计数器。
+ */
+static void before_task_setprocattr_49(hook_fargs4_t *a, const char *hook,
+                                       u32 *counter)
+{
+    const char *name = (const char *)a->arg1;
+    const void *value = (const void *)a->arg2;
+    size_t size = (size_t)a->arg3;
+    u32 n;
+
+    n = READ_ONCE(*counter);
+    if (n < 16) {
+        n++;
+        WRITE_ONCE(*counter, n);
+        pr_info("[selinux_hook] PROBE %s #%u uid=%d comm=%s task=%px arg1=%px arg2=%px arg3=%zu\n",
+                hook, n, current_uid(), current_comm(), (void *)a->arg0,
+                (void *)a->arg1, (void *)a->arg2, size);
+    }
+
+    if (!filter_procattr_current(hook, NULL, name, value, size))
+        return;
+
+    a->skip_origin = 1;
+    a->ret = -EINVAL;
+}
+
+/* Hook: Xiaomi/Polaris 4.9 security_setprocattr(task, name, value, size) */
+static void before_security_setprocattr_task_49(hook_fargs4_t *a, void *u)
+{
+    before_task_setprocattr_49(a, "security_setprocattr_task_49",
+                               &g_setprocattr_probe_count);
+}
+
+/* Hook fallback: Xiaomi/Polaris 4.9 selinux_setprocattr(task, name, value, size) */
+static void before_selinux_setprocattr_task_49(hook_fargs4_t *a, void *u)
+{
+    before_task_setprocattr_49(a, "selinux_setprocattr_task_49",
+                               &g_selinux_setprocattr_probe_count);
+}
+
 /* Hook: legacy security_setprocattr(name, value, size) */
+
 static void before_security_setprocattr_legacy(hook_fargs3_t *a, void *u)
 {
     const char *name = (const char *)a->arg0;
@@ -3723,6 +4047,9 @@ static long init(const char *args, const char *event, void *__user r)
     if (!filp_open_fn || !filp_close_fn || !kernel_read_fn || !vfs_llseek_fn)
         pr_warn("[selinux_hook] cannot find file-read symbols: filp_open=%px filp_close=%px kernel_read=%px vfs_llseek=%px\n",
                 filp_open_fn, filp_close_fn, kernel_read_fn, vfs_llseek_fn);
+    /* 4.9 only / 仅 4.9：解析 APatch 管理器 UID，供 current_is_policy_manager() 使用。 */
+    if (selinux_49_compat_path())
+        detect_apatch_manager_uid();
     security_load_policy_fn = (void *)lookup_name_optional_suffix("security_load_policy");
     security_load_policy_compat_fn = (void *)security_load_policy_fn;
     security_context_to_sid_fn = (void *)lookup_name_optional_suffix("security_context_to_sid");
@@ -3764,10 +4091,17 @@ static long init(const char *args, const char *event, void *__user r)
                 kver, g_selinux_state);
     if (!sidtab_cancel_convert_fn)
         pr_warn("[selinux_hook] cannot find sidtab_cancel_convert, clean snapshot may leave live policy busy\n");
-    if (!security_read_policy_fn)
+    /*
+     * 4.9 security_read_policy ABI is vendor-specific / 4.9 该 helper ABI 依机型变化：
+     * skip snapshot and hook on 4.9; non-4.9 keeps the existing clean-policy path.
+     */
+    if (!security_read_policy_fn) {
         pr_warn("[selinux_hook] cannot find security_read_policy, clean policy snapshot disabled\n");
-    else
+    } else if (selinux_49_compat_path()) {
+        pr_warn("[selinux_hook] skip security_read_policy snapshot on 4.9: helper ABI is device-specific\n");
+    } else {
         snapshot_clean_policy("module_init");
+    }
     if (!security_context_to_sid_fn)
         pr_warn("[selinux_hook] cannot find security_context_to_sid, procattr clean policydb query will use blob fallback\n");
     if (!policydb_read_fn || !policydb_destroy_fn)
@@ -3783,13 +4117,19 @@ static long init(const char *args, const char *event, void *__user r)
         pr_warn("[selinux_hook] intel_av cannot find type_attribute_bounds_av, type bounds masking will be skipped\n");
 
     if (security_read_policy_fn) {
-        int argc = selinux_compat_call_needed() ? 3 : 2;
-        g_funcs[g_hooks++] = (void *)security_read_policy_fn;
-        pr_info("[selinux_hook] hook security_read_policy argc=%d\n", argc);
-        if (selinux_compat_call_needed())
-            hook_wrap((void *)security_read_policy_fn, 3, before_security_read_policy_compat, NULL, NULL);
-        else
-            hook_wrap((void *)security_read_policy_fn, 2, before_security_read_policy, NULL, NULL);
+        /* Non-4.9 only / 仅非 4.9：4.9 不进入 g_hooks++，避免按错误 ABI hook。 */
+        if (!selinux_49_compat_path()) {
+            int argc = selinux_compat_call_needed() ? 3 : 2;
+
+            g_funcs[g_hooks++] = (void *)security_read_policy_fn;
+            pr_info("[selinux_hook] hook security_read_policy argc=%d\n", argc);
+            if (selinux_compat_call_needed())
+                hook_wrap((void *)security_read_policy_fn, 3, before_security_read_policy_compat, NULL, NULL);
+            else
+                hook_wrap((void *)security_read_policy_fn, 2, before_security_read_policy, NULL, NULL);
+        } else {
+            pr_info("[selinux_hook] skip security_read_policy hook on 4.9: helper ABI is device-specific\n");
+        }
     }
 
     addr = (unsigned long)lookup_name_optional_suffix("simple_read_from_buffer");
@@ -3852,26 +4192,39 @@ static long init(const char *args, const char *event, void *__user r)
         selinux_hook_dbg("[selinux_hook] security_load_policy hook skipped; clean snapshots call it directly\n");
     }
 
+    /* setprocattr ABI split / setprocattr ABI 分叉：4.9 是 task-first，其他内核走原签名探测。 */
     addr = (unsigned long)lookup_name_optional_suffix("security_setprocattr");
     if (addr) {
-        bool setprocattr_lsm_arg = security_setprocattr_has_lsm_arg();
+        if (selinux_49_compat_path()) {
+            g_funcs[g_hooks++] = (void *)addr;
+            selinux_hook_dbg("[selinux_hook] hook security_setprocattr argc=4 mode=task 4.9\n");
+            hook_wrap((void *)addr, 4, before_security_setprocattr_task_49, NULL, NULL);
+        } else {
+            bool setprocattr_lsm_arg = security_setprocattr_has_lsm_arg();
 
-        g_funcs[g_hooks++] = (void *)addr;
-        selinux_hook_dbg("[selinux_hook] hook security_setprocattr argc=%d\n",
-                         setprocattr_lsm_arg ? 4 : 3);
-        if (setprocattr_lsm_arg)
-            hook_wrap((void *)addr, 4, before_security_setprocattr, NULL, NULL);
-        else
-            hook_wrap((void *)addr, 3, before_security_setprocattr_legacy, NULL, NULL);
+            g_funcs[g_hooks++] = (void *)addr;
+            selinux_hook_dbg("[selinux_hook] hook security_setprocattr argc=%d\n",
+                             setprocattr_lsm_arg ? 4 : 3);
+            if (setprocattr_lsm_arg)
+                hook_wrap((void *)addr, 4, before_security_setprocattr, NULL, NULL);
+            else
+                hook_wrap((void *)addr, 3, before_security_setprocattr_legacy, NULL, NULL);
+        }
     } else {
         pr_warn("[selinux_hook] cannot find security_setprocattr\n");
     }
 
     addr = (unsigned long)lookup_name_optional_suffix("selinux_setprocattr");
     if (addr) {
-        g_funcs[g_hooks++] = (void *)addr;
-        selinux_hook_dbg("[selinux_hook] hook selinux_setprocattr argc=3\n");
-        hook_wrap((void *)addr, 3, before_selinux_setprocattr, NULL, NULL);
+        if (selinux_49_compat_path()) {
+            g_funcs[g_hooks++] = (void *)addr;
+            selinux_hook_dbg("[selinux_hook] hook selinux_setprocattr argc=4 mode=task 4.9\n");
+            hook_wrap((void *)addr, 4, before_selinux_setprocattr_task_49, NULL, NULL);
+        } else {
+            g_funcs[g_hooks++] = (void *)addr;
+            selinux_hook_dbg("[selinux_hook] hook selinux_setprocattr argc=3\n");
+            hook_wrap((void *)addr, 3, before_selinux_setprocattr, NULL, NULL);
+        }
     } else {
         pr_warn("[selinux_hook] cannot find selinux_setprocattr\n");
     }
@@ -3882,9 +4235,16 @@ static long init(const char *args, const char *event, void *__user r)
         return rc;
     }
 
+    /*
+     * Policydb redirect hooks / policydb 重定向 hooks：
+     * These helpers depend on newer/stateful SELinux ABI. 4.9 already uses the
+     * lightweight legacy filters above, so skip these device-specific hooks there.
+     */
     addr = (unsigned long)lookup_name_optional_suffix("context_struct_compute_av");
     if (addr) {
-        if (clean_policydb_redirect_supported()) {
+        if (selinux_49_compat_path()) {
+            pr_info("[selinux_hook] skip context_struct_compute_av on 4.9: helper ABI is device-specific\n");
+        } else if (clean_policydb_redirect_supported()) {
             g_funcs[g_hooks++] = (void *)addr;
             pr_info("[selinux_hook] hook context_struct_compute_av argc=6\n");
             hook_wrap((void *)addr, 6, before_context_struct_compute_av_policydb,
@@ -3899,30 +4259,42 @@ static long init(const char *args, const char *event, void *__user r)
     }
 
     addr = (unsigned long)lookup_name_optional_suffix("string_to_context_struct");
-    if (addr && clean_policydb_redirect_supported()) {
-        g_funcs[g_hooks++] = (void *)addr;
-        pr_info("[selinux_hook] hook string_to_context_struct argc=5\n");
-        hook_wrap((void *)addr, 5, before_policydb_arg0, NULL, NULL);
-    } else if (addr) {
-        pr_info("[selinux_hook] skip legacy string_to_context_struct policydb redirect\n");
+    if (addr) {
+        if (selinux_49_compat_path()) {
+            pr_info("[selinux_hook] skip string_to_context_struct on 4.9: helper ABI is device-specific\n");
+        } else if (clean_policydb_redirect_supported()) {
+            g_funcs[g_hooks++] = (void *)addr;
+            pr_info("[selinux_hook] hook string_to_context_struct argc=5\n");
+            hook_wrap((void *)addr, 5, before_policydb_arg0, NULL, NULL);
+        } else {
+            pr_info("[selinux_hook] skip legacy string_to_context_struct policydb redirect\n");
+        }
     } else {
         pr_warn("[selinux_hook] cannot find string_to_context_struct\n");
     }
 
     addr = (unsigned long)lookup_name_optional_suffix("selinux_complete_init");
     if (addr) {
-        g_funcs[g_hooks++] = (void *)addr;
-        pr_info("[selinux_hook] hook selinux_complete_init argc=0\n");
-        hook_wrap((void *)addr, 0, NULL, after_selinux_complete_init, NULL);
+        if (selinux_49_compat_path()) {
+            pr_info("[selinux_hook] skip selinux_complete_init on 4.9: helper ABI is device-specific\n");
+        } else {
+            g_funcs[g_hooks++] = (void *)addr;
+            pr_info("[selinux_hook] hook selinux_complete_init argc=0\n");
+            hook_wrap((void *)addr, 0, NULL, after_selinux_complete_init, NULL);
+        }
     } else {
         pr_warn("[selinux_hook] cannot find selinux_complete_init\n");
     }
 
     addr = (unsigned long)lookup_name_optional_suffix("selinux_policy_commit");
     if (addr) {
-        g_funcs[g_hooks++] = (void *)addr;
-        pr_info("[selinux_hook] hook selinux_policy_commit argc=1\n");
-        hook_wrap((void *)addr, 1, NULL, after_selinux_policy_commit, NULL);
+        if (selinux_49_compat_path()) {
+            pr_info("[selinux_hook] skip selinux_policy_commit on 4.9: helper ABI is device-specific\n");
+        } else {
+            g_funcs[g_hooks++] = (void *)addr;
+            pr_info("[selinux_hook] hook selinux_policy_commit argc=1\n");
+            hook_wrap((void *)addr, 1, NULL, after_selinux_policy_commit, NULL);
+        }
     } else {
         pr_warn("[selinux_hook] cannot find selinux_policy_commit\n");
     }
